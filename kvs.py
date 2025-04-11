@@ -19,8 +19,10 @@ class KeyValueStore():
             return 201
     
     def delete(self, key: str) -> bool:
-        res = self.store.pop(key, None) is not None
-        return
+        if key in self.store:
+            del self.store[key]
+            return True
+        return False
     
     def list(self):
         return self.store
