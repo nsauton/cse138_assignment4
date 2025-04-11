@@ -2,7 +2,7 @@
 
 class KeyValueStore():
     def __init__(self):
-        self.store = {"test":"success"}
+        self.store = {}
     
     def get(self, key: str):
         if key in self.store:
