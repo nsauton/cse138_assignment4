@@ -88,7 +88,7 @@ def delete_key(key: str):
 @app.get("/data")
 def list_store():
     
-    if node.NODE_IDENTIFIER not in view:
+    if node.NODE_IDENTIFIER not in node.view:
         raise HTTPException(status_code=503, detail="Node not online yet!")
     
     return store.list()
