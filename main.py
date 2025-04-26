@@ -3,9 +3,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from kvs import KeyValueStore
+from node import Node
 from typing import Optional
+import os
 
+# Initialize the Node ID
+node = Node( int(os.getenv("NODE_IDENTIFIER")) )
 
+class ValueModel(BaseModel):
+    value: str
+    
 
 app = FastAPI()
 
@@ -25,22 +32,27 @@ def read_root():
     return {"message": "Hello world! This is the key-value store API."}
 
 @app.get("/ping")
-'''
-Called with an empty body. Should return status code 200 indicating 
-that the node is initialized and ready to receive requests.
-'''
 def ping():
-    # check if we have a view?
-    return {"message": "OK"}
+    return {"message": "ping!", "node_id": f"{node.NODE_IDENTIFIER}"}
 
 @app.put("/data/{key}")
 def put_value(key: str, response: Response, body: Optional[dict] = Body(default=None)):
+
+    if node.NODE_IDENTIFIER not in node.view:
+        raise HTTPException(status_code=503, detail="Node is not online yet!")
+    
+    if node.NODE_IDENTIFIER != node.primary:
+        # Change Status Code Later
+        raise HTTPException(status_code=503, detail="Node is not a primary!")
+    
     if body is None:
         raise HTTPException(status_code=400, detail="Request body missing!")
 
     value = body.get("value")
     if not isinstance(value, str):
         raise HTTPException(status_code=400, detail="Field 'value' must be a string.")
+    
+    # Communicate with the backups in view!
 
     status = store.put(key, value)
     response.status_code = status
@@ -48,6 +60,10 @@ def put_value(key: str, response: Response, body: Optional[dict] = Body(default=
 
 @app.get("/data/{key}")
 def get_value(key: str):
+
+    if node.NODE_IDENTIFIER not in node.view:
+        raise HTTPException(status_code=503, detail="Node not online yet!")
+        
     value = store.get(key)
     if value is None:
         raise HTTPException(status_code = 404, detail = "Key not found")
@@ -55,14 +71,40 @@ def get_value(key: str):
 
 @app.delete("/data/{key}")
 def delete_key(key: str):
+
+    if node.NODE_IDENTIFIER not in node.view:
+        raise HTTPException(status_code=503, detail="Node not online yet!")
+    
+    if node.NODE_IDENTIFIER != node.primary:
+        # Change Status Code Later
+        raise HTTPException(status_code=503, detail="Node is not a primary!")
+    
+    # Communicate with the backups in view!
+
     if store.delete(key):
         return {"message" : "Key deleted"}
     raise HTTPException(status_code = 404, detail = "Key not found")
 
 @app.get("/data")
 def list_store():
+    
+    if node.NODE_IDENTIFIER not in view:
+        raise HTTPException(status_code=503, detail="Node not online yet!")
+    
     return store.list()
 
 @app.put("/view")
-def put_view(request: Request):
-    
+def view(body: Optional[dict] = Body(default=None)):
+
+    # Store Requested View
+    node.view = {x["id"]:x["address"] for x in body["view"]}
+
+    # Decide a Primary based on smallest NODE_IDENTIFIER
+    if not node.primary or node.primary not in node.view:
+        node.primary = min(node.view)
+
+    # Debugging
+    if node.NODE_IDENTIFIER == node.primary:
+        print("I'm the primary!")
+
+    return {"message": "view!", "node_id": f"{node.NODE_IDENTIFIER}"}
