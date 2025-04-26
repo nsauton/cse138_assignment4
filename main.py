@@ -5,9 +5,7 @@ from pydantic import BaseModel
 from kvs import KeyValueStore
 from typing import Optional
 
-class ValueModel(BaseModel):
-    value: str
-    
+
 
 app = FastAPI()
 
@@ -25,6 +23,15 @@ store = KeyValueStore()
 @app.get("/")
 def read_root():
     return {"message": "Hello world! This is the key-value store API."}
+
+@app.get("/ping")
+'''
+Called with an empty body. Should return status code 200 indicating 
+that the node is initialized and ready to receive requests.
+'''
+def ping():
+    # check if we have a view?
+    return {"message": "OK"}
 
 @app.put("/data/{key}")
 def put_value(key: str, response: Response, body: Optional[dict] = Body(default=None)):
@@ -55,3 +62,7 @@ def delete_key(key: str):
 @app.get("/data")
 def list_store():
     return store.list()
+
+@app.put("/view")
+def put_view(request: Request):
+    
