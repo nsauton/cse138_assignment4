@@ -3,9 +3,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from kvs import KeyValueStore
+from node import Node
 from typing import Optional
+import httpx
+import os
 
+# Initialize the Node ID
+node = Node( int(os.getenv("NODE_IDENTIFIER")) )
 
+class ValueModel(BaseModel):
+    value: str
+    
 
 app = FastAPI()
 
@@ -21,48 +29,135 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 store = KeyValueStore()
 
 @app.get("/")
-def read_root():
+async def read_root():
     return {"message": "Hello world! This is the key-value store API."}
 
 @app.get("/ping")
-'''
-Called with an empty body. Should return status code 200 indicating 
-that the node is initialized and ready to receive requests.
-'''
-def ping():
-    # check if we have a view?
-    return {"message": "OK"}
+async def ping():
+    return {"message": "ping!", "node_id": f"{node.NODE_IDENTIFIER}"}
 
 @app.put("/data/{key}")
-def put_value(key: str, response: Response, body: Optional[dict] = Body(default=None)):
+async def put_value(key: str, response: Response, body: Optional[dict] = Body(default=None)):
+
+    if node.NODE_IDENTIFIER not in node.view:
+        raise HTTPException(status_code=503, detail="Node is not online yet!")
+    
+    # Contact Primary if a write request was received.
+    if node.NODE_IDENTIFIER != node.primary:
+        if node.primary != None and node.primary in node.view:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.put(f"http://{node.view[node.primary]}/data/{key}", json={"value": body.get("value")})
+                    response.status_code = r.status_code # Be sure to recover the status code as we went from BACKUP -> PRIMARY -> BACKUP
+                    return r.json()
+            except httpx.RequestError:
+                raise HTTPException(status_code=408, detail="Timedout!") 
+        else:
+            raise HTTPException(status_code=503, detail="Primary Not Available!")
+    
     if body is None:
         raise HTTPException(status_code=400, detail="Request body missing!")
 
     value = body.get("value")
     if not isinstance(value, str):
         raise HTTPException(status_code=400, detail="Field 'value' must be a string.")
-
+    
+    # Communicate with the backups in view!
+    for node_id in node.view:
+        if node.NODE_IDENTIFIER != node_id:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.put(f"http://{node.view[node_id]}/communication/{key}", json={"value": value})
+            except httpx.RequestError: # Send a timeout response if failure
+                raise HTTPException(status_code=408, detail="Timedout!") 
+                
     status = store.put(key, value)
     response.status_code = status
     return {"message": "Created" if status == 201 else "Updated"}
 
 @app.get("/data/{key}")
-def get_value(key: str):
+async def get_value(key: str):
+
+    if node.NODE_IDENTIFIER not in node.view:
+        raise HTTPException(status_code=503, detail="Node not online yet!")
+        
     value = store.get(key)
     if value is None:
         raise HTTPException(status_code = 404, detail = "Key not found")
     return {"value": value}
 
 @app.delete("/data/{key}")
-def delete_key(key: str):
+async def delete_key(key: str):
+
+    if node.NODE_IDENTIFIER not in node.view:
+        raise HTTPException(status_code=503, detail="Node not online yet!")
+    
+    # Contact Primary if a delete request was received.
+    if node.NODE_IDENTIFIER != node.primary:
+        if node.primary != None and node.primary in node.view:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.delete(f"http://{node.view[node.primary]}/data/{key}")
+                    return r.json()
+            except httpx.RequestError: # Send a timeout response if failure
+                raise HTTPException(status_code=408, detail="Timedout!") 
+        else:
+            raise HTTPException(status_code=503, detail="Primary Not Available!")
+    
+    # Communicate with the backups in view!
+    for node_id in node.view:
+        if node.NODE_IDENTIFIER != node_id:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.delete(f"http://{node.view[node_id]}/communication/{key}")
+            except httpx.RequestError: # Send a timeout response if failure
+                raise HTTPException(status_code=408, detail="Timedout!") 
+
     if store.delete(key):
         return {"message" : "Key deleted"}
     raise HTTPException(status_code = 404, detail = "Key not found")
 
 @app.get("/data")
-def list_store():
+async def list_store():
+    
+    if node.NODE_IDENTIFIER not in node.view:
+        raise HTTPException(status_code=503, detail="Node not online yet!")
+    
     return store.list()
 
 @app.put("/view")
-def put_view(request: Request):
+async def view(body: Optional[dict] = Body(default=None)):
+
+    # Store Requested View
+    node.view = {x["id"]:x["address"] for x in body["view"]}
+
+    # Decide a Primary based on smallest NODE_IDENTIFIER
+    if not node.primary or node.primary not in node.view:
+        node.primary = min(node.view)
+
+    # Debugging
+    if node.NODE_IDENTIFIER == node.primary:
+        print("I'm the primary!")
     
+    return {"message": "view!", "node_id": f"{node.NODE_IDENTIFIER}"}
+
+# The acknowledgement process
+@app.put("/communication/{key}")
+async def communication(key: str, response: Response, body: Optional[dict] = Body(default=None)):
+
+    value = body.get("value")
+
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="Field 'value' must be a string.")
+    
+    status = store.put(key, value)
+    response.status_code = status
+    
+    return {"message": "Backup saved successfully"}
+
+@app.delete("/communication/{key}")
+async def communication(key: str):
+
+    if store.delete(key):
+        return {"message" : "Backup Key deleted"}
+    raise HTTPException(status_code = 404, detail = "Key not found")
