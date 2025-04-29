@@ -127,14 +127,39 @@ async def list_store():
 
 @app.put("/view")
 async def view(body: Optional[dict] = Body(default=None)):
-
+    # Store the old view to compare with the new view
+    old_view = set(node.view)
+    
     # Store Requested View
     node.view = {x["id"]:x["address"] for x in body["view"]}
 
     # Decide a Primary based on smallest NODE_IDENTIFIER
     if not node.primary or node.primary not in node.view:
         node.primary = min(node.view)
-
+    
+    # If this is a backup node, forward the view to the primary
+    if node.NODE_IDENTIFIER != node.primary and node.primary in node.view:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.put(f"http://{node.view[node.primary]}/view", json=body)
+        except httpx.RequestError as e:
+            print(f"Failed to forward view to primary: {e}")
+    
+    # If this is the primary node, push the KVS data to new nodes
+    if node.NODE_IDENTIFIER == node.primary:
+        new_view = set(node.view)
+        new_nodes = new_view - old_view
+        
+        for new_node_id in new_nodes:
+            node_address = node.view[new_node_id]
+            try:
+                async with httpx.AsyncClient() as client:
+                    # Loop through store and send all pairs to new node
+                    for key, value in store.list().items():
+                        await client.put(f"http://{node_address}/communication/{key}", json={"value": value}, timeout=10)
+            except httpx.RequestError as e:
+                print(f"Failed to push data to {node_address}: {e}")
+    
     # Debugging
     if node.NODE_IDENTIFIER == node.primary:
         print("I'm the primary!")
