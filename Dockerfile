@@ -1,14 +1,6 @@
-FROM python:3.11
-
+FROM python:3.12.2-slim
 WORKDIR /app
-
-# copy and install requirements!
-COPY requirements.txt .
+COPY . /app
 RUN pip install --no-cache-dir -r requirements.txt
-
-# copy app code
-COPY . .
-
 EXPOSE 8081
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8081"]
+CMD ["uvicorn", "server:server", "--host", "0.0.0.0", "--port", "8081"]
