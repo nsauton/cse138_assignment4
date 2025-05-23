@@ -31,7 +31,11 @@ async def replicateRequest(method: str, key:str, body:dict = None):
 
 @server.get("/")
 async def hello():
+<<<<<<< HEAD
     return "this is cse138 assignment3!"
+=======
+    return "this cse138 assignment3!"
+>>>>>>> 2572de4 (removed pb stuff and changed data/key endpoints to be causal)
 
 @server.get("/ping")
 def ping():
