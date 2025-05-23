@@ -31,7 +31,7 @@ async def replicateRequest(method: str, key:str, body:dict = None):
 
 @server.get("/")
 async def hello():
-    return "this cse138 assignment2!"
+    return "this is cse138 assignment3!"
 
 @server.get("/ping")
 def ping():
