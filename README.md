@@ -1,15 +1,17 @@
-# cse138_assignment2
+# cse138_assignment3
 
-## Consistent and Replicated
+## Available and Causally Consistent
 
 ### Members & Contribution
 
-- rsingh63
+- Ranvir Singh (rsingh63)
   - Provided clean KVS implementation
   - Worked on View and Ping
-* jdanielf
+- Jeffrey Daniel-Flores (jdanielf)
   - Worked on View, Ping, Primary/Backup Replication
   - Provided Communication Endpoint and Error Handling
+- Nathan Sauton (nsauton)
+  - Provided strongly consistent KVS implementation
 
 
 ## Sources
