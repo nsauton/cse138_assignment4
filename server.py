@@ -5,13 +5,13 @@ import httpx
 import asyncio
 import os
 import time
+import random
 
 server = FastAPI()
 
 kvs = {}
 view = []
 nodeID = int(os.environ.get("NODE_IDENTIFIER", -1)) #every server should have a diff one
-
 key_locks = defaultdict(asyncio.Lock) #for concurrent puts
 
 def dep_check(deps: dict, client_md: dict) -> bool:
@@ -30,8 +30,33 @@ def arbitration_order(local: dict, foreign: dict) -> bool:
         return local["node"] < foreign["node"]
     return False
 
-async def converge_nodes():
+async def converge_nodes(max_nodes: int):
+    gossips = []
+    chosen = random.sample([n for n in view if n["id"] != nodeID], min(max_nodes, len(view)-1))
+
     async with httpx.AsyncClient() as client:
+
+        for node in chosen:
+            gossips.append(client.post(
+                f"http://{node['address']}/internal/converge", 
+                json={"kvs": kvs}
+            ))
+        try:
+            await asyncio.gather(*gossips)
+        except Exception as e:
+            print(f"Gossip error: {e}")
+        
+        '''
+        for i, node in enumerate(view):
+            if i >= max_nodes:
+                break
+            if node["id"] == nodeID:
+                continue
+            await client.post(
+                f"http://{node['address']}/internal/converge", 
+                json={"kvs": kvs}
+            )
+
         for node in view:
             if node["id"] == nodeID:
                 continue
@@ -39,6 +64,13 @@ async def converge_nodes():
                 f"http://{node['address']}/internal/converge", 
                 json={"kvs": kvs}
             )
+        '''
+
+async def background_gossip():
+    while True:
+        await asyncio.sleep(2)
+        if view:
+            await converge_nodes(1)
 
 @server.get("/")
 async def hello():
@@ -80,7 +112,7 @@ async def putKey(key: str, request: Request):
         #print(f"STORED {key=} {kvs[key]}")
 
     client_md.setdefault(key, []).append(version)
-    await converge_nodes() #gossiping, maybe not even necessary
+    await converge_nodes(2) #gossiping, maybe not even necessary
     return JSONResponse(content={"causal-metadata": client_md}, status_code=200)
     
 @server.get("/data/{key}")
@@ -97,7 +129,6 @@ async def getKey(key: str, request: Request):
         raise HTTPException(status_code=400, detail="'causal-metadata' is missing from request body")
     
     client_md = dict(data["causal-metadata"])
-    #key_exists = key in client_md
 
     #print(f"{client_md}, {key_exists}")
 
@@ -106,23 +137,10 @@ async def getKey(key: str, request: Request):
             key_data = kvs[key]
             if dep_check(key_data["deps"], client_md):
                 break
-        else:
-            if key not in client_md:
-                raise HTTPException(status_code=404, detail="key doesn't exist")
-
-        await asyncio.sleep(0.2)  # prevent CPU spin
-
-    '''
-    if key not in kvs:
-        if key_exists:
-            return JSONResponse(content={"message": "waiting on key"}, status_code=408)
-        else:
+        elif key not in client_md:
             raise HTTPException(status_code=404, detail="key doesn't exist")
-        
-    key_data = kvs[key]
-    if not dep_check(key_data["deps"], client_md):
-        return JSONResponse(content={"message": "dependencies not satisfied"}, status_code=408)
-    '''
+
+        await asyncio.sleep(0.2)
 
     client_md.setdefault(key, [])
     #add version to md
@@ -163,7 +181,7 @@ async def getAllKeys():
             elif key not in client_md:
                 raise HTTPException(status_code=404, detail="key doesn't exist")
 
-            await asyncio.sleep(0.2)  # prevent CPU spin
+            await asyncio.sleep(0.2)
 
         client_md.setdefault(key, [])
         #add version to md
@@ -197,9 +215,9 @@ async def putView(request: Request):
         return JSONResponse(content={"message": "new view accepted"}, status_code=200) 
 
     #converge data of all nodes in view
-    await converge_nodes()
+    await converge_nodes(len(view))
     await asyncio.sleep(0.2)
-    await converge_nodes()
+    await converge_nodes(len(view))
 
     return JSONResponse(content={"message": "new view accepted"}, status_code=200)
 
@@ -228,6 +246,9 @@ async def converge(request: Request):
 
     return JSONResponse(content={"message": "convergence done"}, status_code=200)
 
+@server.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_gossip())
 
 if __name__ == '__main__':
     server.run(host='0.0.0.0', port=8081)
