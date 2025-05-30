@@ -14,14 +14,15 @@ view = []
 nodeID = int(os.environ.get("NODE_IDENTIFIER", -1)) #every server should have a diff one
 key_locks = defaultdict(asyncio.Lock) #for concurrent puts
 
+# --- Helpful Functions --- #
 def dep_check(deps: dict, client_md: dict) -> bool:
-    for key, versions in deps.items():
-        if key not in client_md:
+    for dep_key, dep_version in deps.items():
+        if dep_key in client_md:
+            continue
+        else:
             return False
-        for version in versions:
-            if version not in client_md[key]:
-                return False
     return True
+
 
 def arbitration_order(local: dict, foreign: dict) -> bool:
     if local["timestamp"] < foreign["timestamp"]:
@@ -29,6 +30,7 @@ def arbitration_order(local: dict, foreign: dict) -> bool:
     if local["timestamp"] == foreign["timestamp"]:
         return local["node"] < foreign["node"]
     return False
+# --- Helpful Functions --- #
 
 async def converge_nodes(max_nodes: int):
     gossips = []
@@ -45,32 +47,16 @@ async def converge_nodes(max_nodes: int):
             await asyncio.gather(*gossips)
         except Exception as e:
             print(f"Gossip error: {e}")
-        
-        '''
-        for i, node in enumerate(view):
-            if i >= max_nodes:
-                break
-            if node["id"] == nodeID:
-                continue
-            await client.post(
-                f"http://{node['address']}/internal/converge", 
-                json={"kvs": kvs}
-            )
-
-        for node in view:
-            if node["id"] == nodeID:
-                continue
-            await client.post(
-                f"http://{node['address']}/internal/converge", 
-                json={"kvs": kvs}
-            )
-        '''
 
 async def background_gossip():
     while True:
         await asyncio.sleep(2)
         if view:
-            await converge_nodes(1)
+            #print("Gossip time!")
+            await converge_nodes(2)
+
+
+# --- Gossip Protocol --- #
 
 @server.get("/")
 async def hello():
@@ -82,6 +68,8 @@ def ping():
 
 @server.put("/data/{key}")
 async def putKey(key: str, request: Request):
+
+    # --- HTTP Error Handling --- #
     if not view:
         return JSONResponse(content={"message": "node not online"}, status_code=503)
 
@@ -94,29 +82,27 @@ async def putKey(key: str, request: Request):
         raise HTTPException(status_code=400, detail="'value' is missing from request body")
     if "causal-metadata" not in data:
         raise HTTPException(status_code=400, detail="'causal-metadata' is missing from request body")
+    # --- HTTP Error Handling --- #
     
+    # Store client's request such as "value" and "causal-metadata"
     value = data["value"]
     client_md = dict(data["causal-metadata"])
 
     async with key_locks[key]:
-        timestamp = time.time()
-        version = f"{nodeID}_{timestamp}"
-        #print(f"PUT {key=} {version=} {client_md=}")
+        version = {"timestamp": time.time(), "node": nodeID} # ALWAYS update version
         kvs[key] = {
-            "value": value,
-            "timestamp": timestamp,
-            "node": nodeID,
-            "version": version,
-            "deps": dict(client_md)
+            "value": value, # As usual, store value
+            "version": version, # Store timestamp and node ID
+            "deps": dict(client_md) # Dependencies, will help with causal consistency
         }
-        #print(f"STORED {key=} {kvs[key]}")
-
-    client_md.setdefault(key, []).append(version)
+        client_md[key] = version # Update causal-metadata to prepare for gossiping...
     await converge_nodes(2) #gossiping, maybe not even necessary
     return JSONResponse(content={"causal-metadata": client_md}, status_code=200)
     
 @server.get("/data/{key}")
 async def getKey(key: str, request: Request):
+
+     # --- HTTP Error Handling --- #
     if not view:
         return JSONResponse(content={"message": "node not online"}, status_code=503)
     
@@ -127,38 +113,56 @@ async def getKey(key: str, request: Request):
     
     if "causal-metadata" not in data:
         raise HTTPException(status_code=400, detail="'causal-metadata' is missing from request body")
-    
+     # --- HTTP Error Handling --- #
+
+    # Store client's request such as "causal-metadata"
     client_md = dict(data["causal-metadata"])
 
-    #print(f"{client_md}, {key_exists}")
-
     while True:
-        if key in kvs:
-            key_data = kvs[key]
-            if dep_check(key_data["deps"], client_md):
+        # If the client_md is empty, (NO OPERATIONS SEEN)
+            # If it exist in KVS, update client_md and return value.
+            # If it doesn't exist in KVS, return 404.
+        if client_md == {}:
+            if key in kvs:
+                key_data = kvs[key]
+                client_md[key] = key_data["version"]
                 break
-        elif key not in client_md:
-            raise HTTPException(status_code=404, detail="key doesn't exist")
+            else:
+                raise HTTPException(status_code=404, detail="key doesn't exist")
 
-        await asyncio.sleep(0.2)
+        # If the client_md is not empty, (OPERATIONS SEEN)
+        else:
+            if key in kvs:
+                key_data = kvs[key]
+                key_deps = key_data["deps"]
+                key_version = key_data["version"]
+                #print(f"[GET] client_md: {client_md},\n key: {key_data}")
+                if (dep_check(key_deps, client_md)): # Check if the client seen these dependencies
+                    # Check if client has seen this key before
+                    if key in client_md:
+                        client_version = client_md[key]
+                        if client_version["timestamp"] <= key_version["timestamp"]: # we can't read old versions of the key, only newer ones
+                            for dep_key, dep_version in key_deps.items():
+                                if dep_key in client_md:
+                                    if arbitration_order(client_md[dep_key], dep_version):
+                                        client_md[dep_key] = dict(dep_version)      
+                            break
+                    else: # We can accept if it doesn't contain in client_md
+                        for dep_key, dep_version in key_deps.items():
+                            if dep_key in client_md:
+                                if arbitration_order(client_md[dep_key], dep_version):
+                                    client_md[dep_key] = dict(dep_version)    
+                        break
+            await asyncio.sleep(0.2) # Hang indefinitely till the key exist in KVS
 
-    client_md.setdefault(key, [])
-    #add version to md
-    if key_data["version"] not in client_md[key]:
-        client_md[key].append(key_data["version"])
-    #add dependencies to md
-    for key, versions in key_data["deps"].items():
-        client_md.setdefault(key, [])
-        for v in versions:
-            if v not in client_md[key]:
-                client_md[key].append(v)
-
-    #print(f"client-md: {client_md}")
+    client_md[key] = key_data["version"]
 
     return JSONResponse(content={"value": key_data["value"], "causal-metadata": client_md}, status_code=200)
 
 @server.get("/data")
-async def getAllKeys():
+async def getAllKeys(request: Request):
+    
+    # --- HTTP Error Handling --- #
     if not view:
         return JSONResponse(content={"message": "node not online"}, status_code=503)
     
@@ -169,34 +173,64 @@ async def getAllKeys():
     
     if "causal-metadata" not in data:
         raise HTTPException(status_code=400, detail="'causal-metadata' is missing from request body")
+    # --- HTTP Error Handling --- #
     
     client_md = dict(data["causal-metadata"])
     items = {}
 
-    for key in kvs.keys():
+    # Create an union of keys (KVS's keys U Client's Seen Operations)
+    keys_set = set(kvs.keys()).union(set(client_md.keys()))
+
+    for key in keys_set:
         while True:
-            data = kvs[key]
-            if dep_check(data["deps"], client_md):
-                break
-            elif key not in client_md:
-                raise HTTPException(status_code=404, detail="key doesn't exist")
+            # If the client_md is empty, (NO OPERATIONS SEEN)
+                # If it exist in KVS, update save value but dont update metadata till later
+                # If it doesn't exist in KVS, return 404.
+            if client_md == {}:
+                if key in kvs:
+                    key_data = kvs[key]
+                    break
+                else:
+                    raise HTTPException(status_code=404, detail="key doesn't exist")
 
-            await asyncio.sleep(0.2)
+            # If the client_md is not empty, (OPERATIONS SEEN)
+            else:
+                if key in kvs:
+                    key_data = kvs[key]
+                    key_deps = key_data["deps"]
+                    key_version = key_data["version"]
+                    #print(f"[GET] client_md: {client_md},\n key: {key_data}")
+                    if (dep_check(key_deps, client_md)): # Check if the client seen these dependencies
+                        # Check if client has seen this key before
+                        if key in client_md:
+                            client_version = client_md[key]
+                            if client_version["timestamp"] <= key_version["timestamp"]: # we can't read old versions of the key, only newer ones
+                                for dep_key, dep_version in key_deps.items():
+                                    if dep_key in client_md:
+                                        if arbitration_order(client_md[dep_key], dep_version):
+                                            client_md[dep_key] = dict(dep_version)      
+                                break
+                        else: # We can accept if it doesn't contain in client_md
+                            for dep_key, dep_version in key_deps.items():
+                                if dep_key in client_md:
+                                    if arbitration_order(client_md[dep_key], dep_version):
+                                        client_md[dep_key] = dict(dep_version)    
+                            break
+                await asyncio.sleep(0.2) # Hang indefinitely till the key exist in KVS
 
-        client_md.setdefault(key, [])
-        #add version to md
-        if data["version"] not in client_md[key]:
-            client_md[key].append(data["version"])
-        #add dependencies to md
-        for dep_key, versions in data["deps"].items():
-            client_md.setdefault(dep_key, [])
-            for v in versions:
-                if v not in client_md[dep_key]:
-                    client_md[dep_key].append(v)
+        #update items with key and client md if it was not empty to start
+        items[key] = key_data["value"]
+        if not client_md == {}:
+            client_md[key] = key_data["version"]
 
-        items[key] = data["value"]
+    #finally update metadata for clients who came in with empty md
+    if client_md == {}:
+        for key in items:
+            client_md[key] = kvs[key]["version"]
 
+    #print(items)
     return JSONResponse(content={"items": items, "causal-metadata": client_md}, status_code=200)
+
 
 @server.put("/view")
 async def putView(request: Request):
@@ -205,9 +239,6 @@ async def putView(request: Request):
         data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="json body missing from request")
-    
-    if "view" not in data:
-        raise HTTPException(status_code=400, detail="'view' is missing from request body")
     
     view = data["view"]
     if not any(node["id"] == nodeID for node in view):
@@ -228,27 +259,26 @@ async def converge(request: Request):
 
     for key, data in foreign_kvs.items():
         async with key_locks[key]:
+            #print(f"Local KVS: {kvs}\nForeign KVS: {foreign_kvs}")
             if key in kvs:
-                #if versions match up go to next key
+                # If the version is the same, it's okay
                 if data["version"] == kvs[key]["version"]:
                     continue
-
-                #if incoming key causally depends on version present then just accept it
-                if dep_check(data["deps"], {key: kvs[key]["version"]}):
+                # We want the most recent version of the key
+                if arbitration_order(kvs[key]["version"], data["version"]):
                     kvs[key] = dict(data)
-                elif not dep_check(data["deps"], {key: kvs[key]["version"]}) and not dep_check(kvs[key]["deps"], {key: [data["version"]]}):
-                    #if versions are concurrent check the arbitration order
-                    if arbitration_order(kvs[key], data):
-                        kvs[key] = dict(data)
-                #if logic reaches here, incoming version is an old version so ignore it
+                    kvs[key]["deps"] = dict()
             else:
+                # If local KVS doesn't contain the key, ADD IT
                 kvs[key] = dict(data)
+                kvs[key]["deps"] = dict()
 
     return JSONResponse(content={"message": "convergence done"}, status_code=200)
 
 @server.on_event("startup")
 async def startup_event():
     asyncio.create_task(background_gossip())
+
 
 if __name__ == '__main__':
     server.run(host='0.0.0.0', port=8081)
