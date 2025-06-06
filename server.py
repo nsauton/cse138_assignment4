@@ -6,13 +6,17 @@ import asyncio
 import os
 import time
 import random
+import hashlib
+import json
 
 server = FastAPI()
 
 kvs = {}
-view = []
+view = {}
 nodeID = int(os.environ.get("NODE_IDENTIFIER", -1)) #every server should have a diff one
 key_locks = defaultdict(asyncio.Lock) #for concurrent puts
+shard_nodes = []
+shard_name = ""
 
 # --- Helpful Functions --- #
 def dep_check(deps: dict, client_md: dict) -> bool:
@@ -23,22 +27,47 @@ def dep_check(deps: dict, client_md: dict) -> bool:
             return False
     return True
 
-
 def arbitration_order(local: dict, foreign: dict) -> bool:
     if local["timestamp"] < foreign["timestamp"]:
         return True
     if local["timestamp"] == foreign["timestamp"]:
         return local["node"] < foreign["node"]
     return False
+
+def find_correct_shard(key: str) -> str:
+    shard_names = sorted(view.keys())
+    hash = int(hashlib.sha1(key.encode()).hexdigest(), 16)
+    return shard_names[hash % len(shard_names)]
 # --- Helpful Functions --- #
+
+# --- Async functions --- #
+async def send_key_to_shard(key: str, entry: dict, nodes: list[dict]):
+    tasks = []
+    async with httpx.AsyncClient() as client:
+        for node in nodes:
+            tasks.append(client.post(
+                f"http://{node['address']}/internal/acceptKey",
+                json={
+                    "key": key, 
+                    "value": entry["value"],
+                    "version": entry["version"],
+                    "deps": entry["deps"]
+                }
+            ))
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"failed to send key: {e}")
+
 
 async def converge_nodes(max_nodes: int):
     gossips = []
-    chosen = random.sample([n for n in view if n["id"] != nodeID], min(max_nodes, len(view)-1))
+    #just gonna converge with all nodes in the shard for now
+    #chosen = random.sample([n for n in view if n["id"] != nodeID], min(max_nodes, len(view)-1))
 
     async with httpx.AsyncClient() as client:
 
-        for node in chosen:
+        for node in shard_nodes:
             gossips.append(client.post(
                 f"http://{node['address']}/internal/converge", 
                 json={"kvs": kvs}
@@ -83,6 +112,21 @@ async def putKey(key: str, request: Request):
     if "causal-metadata" not in data:
         raise HTTPException(status_code=400, detail="'causal-metadata' is missing from request body")
     # --- HTTP Error Handling --- #
+
+    # check if key belongs in this shard else proxy it to correct shard, just use put
+    correct_shard = find_correct_shard(key)
+    if correct_shard != shard_name:
+        print(f"wrong shard sending to sorrect shard: {correct_shard}")
+        node = random.choice(view[correct_shard])
+        async with httpx.AsyncClient() as client:
+            try:
+                res = await client.put(
+                    f"http://{node["address"]}/data/{key}",
+                    json=data
+                )
+                return JSONResponse(content=res.json(), status_code=res.status_code)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail="forwarding failed")
     
     # Store client's request such as "value" and "causal-metadata"
     value = data["value"]
@@ -101,22 +145,42 @@ async def putKey(key: str, request: Request):
     
 @server.get("/data/{key}")
 async def getKey(key: str, request: Request):
-
-     # --- HTTP Error Handling --- #
     if not view:
         return JSONResponse(content={"message": "node not online"}, status_code=503)
     
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="json body missing from request")
-    
-    if "causal-metadata" not in data:
-        raise HTTPException(status_code=400, detail="'causal-metadata' is missing from request body")
+    #getting md from header
+    client_md = {}
+    header_md = request.headers.get("X-Causal-Metadata")
+    if header_md:
+        client_md = json.loads(header_md)
+    else:
+     # --- HTTP Error Handling --- #
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="json body missing from request")
+        
+        if "causal-metadata" not in data:
+            raise HTTPException(status_code=400, detail="'causal-metadata' is missing from request body")
+        
+        # Store client's request such as "causal-metadata"
+        client_md = dict(data["causal-metadata"])
      # --- HTTP Error Handling --- #
 
-    # Store client's request such as "causal-metadata"
-    client_md = dict(data["causal-metadata"])
+    #check if key belongs in this shard else proxy it to correct shard, just use get
+    correct_shard = find_correct_shard(key)
+    if correct_shard != shard_name:
+        print(f"wrong shard sending to sorrect shard: {correct_shard}")
+        node = random.choice(view[correct_shard])
+        async with httpx.AsyncClient() as client:
+            try:
+                res = await client.get(
+                    f"http://{node["address"]}/data/{key}",
+                    headers={"X-Causal-Metadata": json.dumps(client_md)}
+                )
+                return JSONResponse(content=res.json(), status_code=res.status_code)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail="forwarding failed")
 
     while True:
         # If the client_md is empty, (NO OPERATIONS SEEN)
@@ -176,7 +240,10 @@ async def getAllKeys(request: Request):
     # --- HTTP Error Handling --- #
     
     client_md = dict(data["causal-metadata"])
+    initial_md = dict(client_md)
     items = {}
+
+    #get all keys in this shard
 
     # Create an union of keys (KVS's keys U Client's Seen Operations)
     keys_set = set(kvs.keys()).union(set(client_md.keys()))
@@ -186,7 +253,7 @@ async def getAllKeys(request: Request):
             # If the client_md is empty, (NO OPERATIONS SEEN)
                 # If it exist in KVS, update save value but dont update metadata till later
                 # If it doesn't exist in KVS, return 404.
-            if client_md == {}:
+            if initial_md == {}:
                 if key in kvs:
                     key_data = kvs[key]
                     break
@@ -200,33 +267,34 @@ async def getAllKeys(request: Request):
                     key_deps = key_data["deps"]
                     key_version = key_data["version"]
                     #print(f"[GET] client_md: {client_md},\n key: {key_data}")
-                    if (dep_check(key_deps, client_md)): # Check if the client seen these dependencies
+                    if (dep_check(key_deps, initial_md)): # Check if the client seen these dependencies
                         # Check if client has seen this key before
-                        if key in client_md:
-                            client_version = client_md[key]
+                        if key in initial_md:
+                            client_version = initial_md[key]
                             if client_version["timestamp"] <= key_version["timestamp"]: # we can't read old versions of the key, only newer ones
                                 for dep_key, dep_version in key_deps.items():
-                                    if dep_key in client_md:
-                                        if arbitration_order(client_md[dep_key], dep_version):
+                                    if dep_key in initial_md:
+                                        if arbitration_order(initial_md[dep_key], dep_version):
                                             client_md[dep_key] = dict(dep_version)      
                                 break
                         else: # We can accept if it doesn't contain in client_md
                             for dep_key, dep_version in key_deps.items():
-                                if dep_key in client_md:
-                                    if arbitration_order(client_md[dep_key], dep_version):
+                                if dep_key in initial_md:
+                                    if arbitration_order(initial_md[dep_key], dep_version):
                                         client_md[dep_key] = dict(dep_version)    
                             break
                 await asyncio.sleep(0.2) # Hang indefinitely till the key exist in KVS
 
         #update items with key and client md if it was not empty to start
         items[key] = key_data["value"]
-        if not client_md == {}:
-            client_md[key] = key_data["version"]
+        client_md[key] = key_data["version"]
 
+    '''
     #finally update metadata for clients who came in with empty md
     if client_md == {}:
         for key in items:
             client_md[key] = kvs[key]["version"]
+    '''
 
     #print(items)
     return JSONResponse(content={"items": items, "causal-metadata": client_md}, status_code=200)
@@ -234,23 +302,64 @@ async def getAllKeys(request: Request):
 
 @server.put("/view")
 async def putView(request: Request):
-    global view
+    global view, shard_nodes, shard_name
     try:
         data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="json body missing from request")
     
     view = data["view"]
-    if not any(node["id"] == nodeID for node in view):
-        view = []
-        return JSONResponse(content={"message": "new view accepted"}, status_code=200) 
+    shard_name = ""
+    shard_nodes = []
+    for name, nodes in data["view"].items():
+        #print(f"name: {name}, nodes: {nodes}")
+        if any(node["id"] == nodeID for node in nodes):
+            shard_nodes = nodes
+            shard_name = name
+    
+    print(f"name: {shard_name}, nodes: {shard_nodes}")
+    
+    #transfer key info to correct shard
+    bad_keys = []
+    for key, entry in kvs.items():
+        correct_shard = find_correct_shard(key)
+        print(correct_shard)
+        if correct_shard != shard_name:
+            await send_key_to_shard(key, entry, view[correct_shard])
+            bad_keys.append(key)
 
+    for key in bad_keys:
+        del kvs[key]
+
+    #this may no longer be needed
+    '''
     #converge data of all nodes in view
     await converge_nodes(len(view))
     await asyncio.sleep(0.2)
     await converge_nodes(len(view))
+    '''
+
+    if not shard_name:
+        view = {}
 
     return JSONResponse(content={"message": "new view accepted"}, status_code=200)
+
+#Post helper routes
+
+@server.post("/internal/acceptKey")
+async def acceptKey(request: Request):
+    data = await request.json()
+    key = data["key"]
+    entry = {
+        "value": data["value"],
+        "version": data["version"], 
+        "deps": data["deps"],
+    }
+
+    async with key_locks[key]:
+        kvs[key] = entry
+
+    return JSONResponse(content={"message": "sent key accpeted"}, status_code=200)
 
 @server.post("/internal/converge")
 async def converge(request: Request):
