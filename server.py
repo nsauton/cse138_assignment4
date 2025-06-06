@@ -243,10 +243,16 @@ async def getAllKeys(request: Request):
     initial_md = dict(client_md)
     items = {}
 
-    #get all keys in this shard
-
-    # Create an union of keys (KVS's keys U Client's Seen Operations)
-    keys_set = set(kvs.keys()).union(set(client_md.keys()))
+    # just get the keys that belong to this shard
+    keys_set = set()
+    for key in kvs.keys():
+        if find_correct_shard(key) == shard_name:
+            keys_set.add(key)
+    
+    # include keys from client metadata that also belong to this shard
+    for key in client_md.keys():
+        if find_correct_shard(key) == shard_name:
+            keys_set.add(key)
 
     for key in keys_set:
         while True:
