@@ -378,6 +378,9 @@ async def deactivateNode(request: Request):
     #accept new view
     data = await request.json()
     view = data["view"]
+    
+    shard_name = ""
+    shard_nodes = []
 
     #send all keys to correct shard
     bad_keys = []
@@ -393,8 +396,6 @@ async def deactivateNode(request: Request):
             
     #reset view and shard stuff to default values
     view = {}
-    shard_name = ""
-    shard_nodes = []
     
     return JSONResponse(content={"message": "new view accepted"}, status_code=200)
 
