@@ -35,6 +35,7 @@ def arbitration_order(local: dict, foreign: dict) -> bool:
     return False
 
 def find_correct_shard(key: str) -> str:
+    print(f"shards: {view.keys()}")
     shard_names = sorted(view.keys())
     hash = int(hashlib.sha1(key.encode()).hexdigest(), 16)
     return shard_names[hash % len(shard_names)]
@@ -243,10 +244,16 @@ async def getAllKeys(request: Request):
     initial_md = dict(client_md)
     items = {}
 
-    #get all keys in this shard
-
-    # Create an union of keys (KVS's keys U Client's Seen Operations)
-    keys_set = set(kvs.keys()).union(set(client_md.keys()))
+    # just get the keys that belong to this shard
+    keys_set = set()
+    for key in kvs.keys():
+        if find_correct_shard(key) == shard_name:
+            keys_set.add(key)
+    
+    # include keys from client metadata that also belong to this shard
+    for key in client_md.keys():
+        if find_correct_shard(key) == shard_name:
+            keys_set.add(key)
 
     for key in keys_set:
         while True:
@@ -308,14 +315,30 @@ async def putView(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="json body missing from request")
     
+    old_view = dict(view)
     view = data["view"]
+
+    #assign node to correct shard
     shard_name = ""
     shard_nodes = []
+    active_nodes = [] #used to compare to old view nodes
     for name, nodes in data["view"].items():
         #print(f"name: {name}, nodes: {nodes}")
-        if any(node["id"] == nodeID for node in nodes):
-            shard_nodes = nodes
-            shard_name = name
+        for node in nodes:
+            active_nodes.append(node)
+            if node["id"] == nodeID:
+                shard_nodes = nodes
+                shard_name = name
+
+    #deactivate all nodes not in new view
+    async with httpx.AsyncClient() as client:
+        for shard in old_view.values():
+            for node in shard:
+                if node not in active_nodes:
+                    await client.post(
+                        f"http://{node['address']}/internal/deactivate",
+                        json={"view": view}
+                    )
     
     print(f"name: {shard_name}, nodes: {shard_nodes}")
     
@@ -323,7 +346,7 @@ async def putView(request: Request):
     bad_keys = []
     for key, entry in kvs.items():
         correct_shard = find_correct_shard(key)
-        print(correct_shard)
+        print(f"key: {key} to shard: {correct_shard}")
         if correct_shard != shard_name:
             await send_key_to_shard(key, entry, view[correct_shard])
             bad_keys.append(key)
@@ -345,6 +368,35 @@ async def putView(request: Request):
     return JSONResponse(content={"message": "new view accepted"}, status_code=200)
 
 #Post helper routes
+
+@server.post("/internal/deactivate")
+async def deactivateNode(request: Request):
+    global view, shard_nodes, shard_name
+    if not view:
+        return JSONResponse(content={"message": "new view already accepted"}, status_code=200)
+    
+    #accept new view
+    data = await request.json()
+    view = data["view"]
+
+    #send all keys to correct shard
+    bad_keys = []
+    for key, entry in kvs.items():
+        correct_shard = find_correct_shard(key)
+        print(f"key: {key} to shard: {correct_shard}")
+        if correct_shard != shard_name:
+            await send_key_to_shard(key, entry, view[correct_shard])
+            bad_keys.append(key)
+
+    for key in bad_keys:
+        del kvs[key]
+            
+    #reset view and shard stuff to default values
+    view = {}
+    shard_name = ""
+    shard_nodes = []
+    
+    return JSONResponse(content={"message": "new view accepted"}, status_code=200)
 
 @server.post("/internal/acceptKey")
 async def acceptKey(request: Request):
