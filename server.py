@@ -120,14 +120,15 @@ async def putKey(key: str, request: Request):
         print(f"wrong shard sending to sorrect shard: {correct_shard}")
         node = random.choice(view[correct_shard])
         async with httpx.AsyncClient() as client:
-            try:
-                res = await client.put(
-                    f"http://{node["address"]}/data/{key}",
-                    json=data
-                )
-                return JSONResponse(content=res.json(), status_code=res.status_code)
-            except Exception as e:
-                raise HTTPException(status_code=503, detail="forwarding failed")
+            while True:
+                try:
+                    res = await client.put(
+                        f"http://{node["address"]}/data/{key}",
+                        json=data
+                    )
+                    return JSONResponse(content=res.json(), status_code=res.status_code)
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    await asyncio.sleep(0.2)
     
     # Store client's request such as "value" and "causal-metadata"
     value = data["value"]
@@ -174,14 +175,15 @@ async def getKey(key: str, request: Request):
         print(f"wrong shard sending to sorrect shard: {correct_shard}")
         node = random.choice(view[correct_shard])
         async with httpx.AsyncClient() as client:
-            try:
-                res = await client.get(
-                    f"http://{node["address"]}/data/{key}",
-                    headers={"X-Causal-Metadata": json.dumps(client_md)}
-                )
-                return JSONResponse(content=res.json(), status_code=res.status_code)
-            except Exception as e:
-                raise HTTPException(status_code=503, detail="forwarding failed")
+            while True:
+                try:
+                    res = await client.get(
+                        f"http://{node["address"]}/data/{key}",
+                        headers={"X-Causal-Metadata": json.dumps(client_md)}
+                    )
+                    return JSONResponse(content=res.json(), status_code=res.status_code)
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    await asyncio.sleep(0.2)
 
     while True:
         # If the client_md is empty, (NO OPERATIONS SEEN)
@@ -378,7 +380,7 @@ async def deactivateNode(request: Request):
     #accept new view
     data = await request.json()
     view = data["view"]
-    
+
     shard_name = ""
     shard_nodes = []
 
