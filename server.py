@@ -35,7 +35,7 @@ def arbitration_order(local: dict, foreign: dict) -> bool:
     return False
 
 def find_correct_shard(key: str) -> str:
-    print(f"shards: {view.keys()}")
+    #print(f"shards: {view.keys()}")
     shard_names = sorted(view.keys())
     hash = int(hashlib.sha1(key.encode()).hexdigest(), 16)
     return shard_names[hash % len(shard_names)]
@@ -117,7 +117,7 @@ async def putKey(key: str, request: Request):
     # check if key belongs in this shard else proxy it to correct shard, just use put
     correct_shard = find_correct_shard(key)
     if correct_shard != shard_name:
-        print(f"wrong shard sending to sorrect shard: {correct_shard}")
+        #print(f"wrong shard sending to sorrect shard: {correct_shard}")
         node = random.choice(view[correct_shard])
         async with httpx.AsyncClient() as client:
             while True:
@@ -172,14 +172,15 @@ async def getKey(key: str, request: Request):
     #check if key belongs in this shard else proxy it to correct shard, just use get
     correct_shard = find_correct_shard(key)
     if correct_shard != shard_name:
-        print(f"wrong shard sending to sorrect shard: {correct_shard}")
+        #print(f"wrong shard sending to sorrect shard: {correct_shard}")
         node = random.choice(view[correct_shard])
         async with httpx.AsyncClient() as client:
+            xmd = json.dumps(client_md)
             while True:
                 try:
                     res = await client.get(
                         f"http://{node["address"]}/data/{key}",
-                        headers={"X-Causal-Metadata": json.dumps(client_md)}
+                        headers={"X-Causal-Metadata": xmd}
                     )
                     return JSONResponse(content=res.json(), status_code=res.status_code)
                 except (httpx.ConnectError, httpx.ConnectTimeout):
@@ -342,13 +343,13 @@ async def putView(request: Request):
                         json={"view": view}
                     )
     
-    print(f"name: {shard_name}, nodes: {shard_nodes}")
+    #print(f"name: {shard_name}, nodes: {shard_nodes}")
     
     #transfer key info to correct shard
     bad_keys = []
     for key, entry in kvs.items():
         correct_shard = find_correct_shard(key)
-        print(f"key: {key} to shard: {correct_shard}")
+        #print(f"key: {key} to shard: {correct_shard}")
         if correct_shard != shard_name:
             await send_key_to_shard(key, entry, view[correct_shard])
             bad_keys.append(key)
@@ -388,7 +389,7 @@ async def deactivateNode(request: Request):
     bad_keys = []
     for key, entry in kvs.items():
         correct_shard = find_correct_shard(key)
-        print(f"key: {key} to shard: {correct_shard}")
+        #print(f"key: {key} to shard: {correct_shard}")
         if correct_shard != shard_name:
             await send_key_to_shard(key, entry, view[correct_shard])
             bad_keys.append(key)
